@@ -116,10 +116,18 @@ class StreamingController:
                 text_size=self._cfg.body_text_size,
             )
             card_id = await self._client.cardkit_create(card)
-            card_msg_id = await self._client.reply_card_by_id(
-                reply_to_message_id,
-                card_id,
-            )
+            
+            # 若有明确的回复目标且非主动会话，则走 reply；若是主动/异步生成会话 (proactive_)，走独立卡片发送
+            if reply_to_message_id and not str(reply_to_message_id).startswith("proactive_"):
+                card_msg_id = await self._client.reply_card_by_id(
+                    reply_to_message_id,
+                    card_id,
+                )
+            else:
+                card_msg_id = await self._client.send_card_by_id_to_chat(
+                    session.chat_id,
+                    card_id,
+                )
             session.set_card(card_id=card_id, card_msg_id=card_msg_id)
             session.element_count = 1  # loading element
             session.flush.set_throttle(CARDKIT_MS)

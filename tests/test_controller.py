@@ -50,6 +50,17 @@ def test_on_message_started_ignores_missing_message_id(message_id: str | None) -
     assert ctrl._sessions == {}
 
 
+def test_on_message_started_ignores_non_feishu_platform() -> None:
+    ctrl = StreamCardController()
+    _enable(ctrl)
+    with patch.object(ctrl, "_fire_and_forget", side_effect=lambda coro, loop: coro.close()):
+        ctrl.on_message_started(message_id="tg_123", chat_id="12345", platform="telegram")
+        assert "tg_123" not in ctrl._sessions
+        ctrl.on_message_started(message_id="feishu_123", chat_id="oc_123", platform="feishu")
+        assert "feishu_123" in ctrl._sessions
+        ctrl._cleanup("feishu_123")
+
+
 def test_on_message_started_registers_anchor_alias_and_cleanup() -> None:
     ctrl = StreamCardController()
     _enable(ctrl)

@@ -222,7 +222,7 @@ def _build_display_block(
                 return _fenced_block("json", pretty)
             except json.JSONDecodeError:
                 pass
-        return _fenced_block("text" if fallback_lang == "json" else fallback_lang, normalized)
+        return _fenced_block("text" if fallback_lang == "json" or fallback_lang == "PLAIN_TEXT" else fallback_lang, normalized)
     if isinstance(value, (dict, list)):
         try:
             return _fenced_block("json", json.dumps(value, ensure_ascii=False, indent=2))
@@ -233,6 +233,9 @@ def _build_display_block(
 
 
 def _fenced_block(language: str, content: str) -> ToolBlock:
+    normalized_lang = language.strip().lower().replace("-", "_")
+    if normalized_lang in {"text", "plain_text", "plaintext"}:
+        return {"language": "text", "content": content, "fenced": content}
     fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", content)), default=0) + 1)
     return {"language": language, "content": content, "fenced": f"{fence}{language}\n{content}\n{fence}"}
 

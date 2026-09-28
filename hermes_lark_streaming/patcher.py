@@ -26,6 +26,7 @@ _HOOK_NAMES = [
     "COMPLETE",
     "FOLLOWUP_COMPLETE",
     "FOLLOWUP_RESULT",
+    "FOLLOWUP_DELIVERY",
     "TOOL",
     "ANSWER",
     "THINKING",
@@ -42,14 +43,15 @@ MK_START, MK_START_END = MARKERS[1]
 MK_COMPLETE, MK_COMPLETE_END = MARKERS[2]
 MK_FOLLOWUP_COMPLETE, MK_FOLLOWUP_COMPLETE_END = MARKERS[3]
 MK_FOLLOWUP_RESULT, MK_FOLLOWUP_RESULT_END = MARKERS[4]
-MK_TOOL, MK_TOOL_END = MARKERS[5]
-MK_ANSWER, MK_ANSWER_END = MARKERS[6]
-MK_THINKING, MK_THINKING_END = MARKERS[7]
-MK_REASONING, MK_REASONING_END = MARKERS[8]
-MK_BACKGROUND_REVIEW, MK_BACKGROUND_REVIEW_END = MARKERS[9]
-MK_ABORT, MK_ABORT_END = MARKERS[10]
-MK_INTERRUPT, MK_INTERRUPT_END = MARKERS[11]
-MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[12]
+MK_FOLLOWUP_DELIVERY, MK_FOLLOWUP_DELIVERY_END = MARKERS[5]
+MK_TOOL, MK_TOOL_END = MARKERS[6]
+MK_ANSWER, MK_ANSWER_END = MARKERS[7]
+MK_THINKING, MK_THINKING_END = MARKERS[8]
+MK_REASONING, MK_REASONING_END = MARKERS[9]
+MK_BACKGROUND_REVIEW, MK_BACKGROUND_REVIEW_END = MARKERS[10]
+MK_ABORT, MK_ABORT_END = MARKERS[11]
+MK_INTERRUPT, MK_INTERRUPT_END = MARKERS[12]
+MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[13]
 
 _BACKUP_SUFFIX = ".hermes_lark.bak"
 
@@ -69,11 +71,25 @@ def _module_to_path(module_name: str) -> Path:
     return Path(*module_name.split(".")).with_suffix(".py")
 
 
-# 候选代码根目录，按优先级排列（来源: Hermes 官方安装文档 Install Layout）。
-# - per-user git installer: <HERMES_HOME>/hermes-agent/
-# - root-mode (sudo curl|bash): /usr/local/lib/hermes-agent/
+# 候选代码根目录。生产默认 Home 下可能遗留旧 checkout；此时优先运行时
+# import 根。显式切换 HERMES_HOME（测试、profile、独立安装）时则严格优先该 Home。
 def _code_roots() -> list[Path]:
-    return [hermes_home() / "hermes-agent", Path("/usr/local/lib/hermes-agent")]
+    home_root = hermes_home() / "hermes-agent"
+    default_home = Path.home() / ".hermes"
+    roots: list[Path] = [home_root] if hermes_home() != default_home else []
+    try:
+        spec = importlib.util.find_spec("gateway")
+        locations = spec.submodule_search_locations if spec else None
+        for location in locations or []:
+            candidate = Path(location).parent
+            if candidate not in roots:
+                roots.append(candidate)
+    except Exception:
+        _logger.debug("Unable to resolve active gateway import root", exc_info=True)
+    for candidate in (Path("/usr/local/lib/hermes-agent"), home_root):
+        if candidate not in roots:
+            roots.append(candidate)
+    return roots
 
 
 # venv 内 python 解释器候选（覆盖 venv/.venv 命名变体）。
@@ -231,13 +247,20 @@ def _start_hook(indent: str) -> str:
         MK_START_END,
         [
             "try:",
-            "    from hermes_lark_streaming.patch import on_message_started",
-            "    _lark_anchor_id = self._reply_anchor_for_event(event)",
-            "    on_message_started(",
-            "        message_id=event.message_id or _lark_anchor_id,",
-            "        chat_id=source.chat_id,",
-            "        anchor_id=_lark_anchor_id,",
-            "    )",
+            "    _lark_p = str(getattr(getattr(source, 'platform', None), 'value', None) or getattr(source, 'platform', '') or getattr(event, 'platform', '')).lower()",
+            "    if 'feishu' in _lark_p or 'lark' in _lark_p:",
+            "        from hermes_lark_streaming.patch import on_message_started",
+            "        import uuid as _lark_uuid",
+            "        _lark_anchor_id = self._reply_anchor_for_event(event)",
+            "        _lark_inbound_id = event.message_id or _lark_anchor_id or f'proactive_{_lark_uuid.uuid4().hex}'",
+            "        on_message_started(",
+            "            message_id=_lark_inbound_id,",
+            "            chat_id=source.chat_id,",
+            "            anchor_id=_lark_anchor_id,",
+            "            platform=_lark_p,",
+            "        )",
+            "        if not getattr(event, 'message_id', None):",
+            "            event.message_id = _lark_inbound_id",
             "except Exception:",
             "    pass",
         ],
@@ -251,26 +274,64 @@ def _complete_hook(indent: str) -> str:
         MK_COMPLETE_END,
         [
             "try:",
-            "    from hermes_lark_streaming.patch import on_message_completed_wait, on_message_needs_text_fallback",
-            "    _lark_completion_id = agent_result.get('_hermes_lark_completion_id') or event.message_id",
-            "    _lark_card_sent = await on_message_completed_wait(",
-            "        message_id=_lark_completion_id,",
-            "        answer=response,",
-            "        duration=_response_time,",
-            "        model=agent_result.get('model', ''),",
-            "        tokens={",
-            "            'input_tokens': agent_result.get('input_tokens', 0),",
-            "            'output_tokens': agent_result.get('output_tokens', 0),",
-            "        },",
-            "        context={",
-            "            'used_tokens': agent_result.get('last_prompt_tokens', 0),",
-            "            'max_tokens': agent_result.get('context_length', 0),",
-            "        },",
-            "    )",
-            "    if _lark_card_sent:",
-            "        agent_result['already_sent'] = True",
-            "    elif on_message_needs_text_fallback(message_id=_lark_completion_id):",
-            "        agent_result.pop('already_sent', None)",
+            "    _lark_p = str(getattr(getattr(source, 'platform', None), 'value', None) or getattr(source, 'platform', '') or getattr(event, 'platform', '')).lower()",
+            "    if 'feishu' in _lark_p or 'lark' in _lark_p:",
+            "        from hermes_lark_streaming.patch import on_message_completed_wait, on_message_needs_text_fallback",
+            "        _lark_completion_id = agent_result.get('_hermes_lark_completion_id') or event.message_id",
+            "        _lark_card_sent = await on_message_completed_wait(",
+            "            message_id=_lark_completion_id,",
+            "            answer=response,",
+            "            duration=_response_time,",
+            "            model=agent_result.get('model', ''),",
+            "            tokens={",
+            "                'input_tokens': agent_result.get('input_tokens', 0),",
+            "                'output_tokens': agent_result.get('output_tokens', 0),",
+            "            },",
+            "            context={",
+            "                'used_tokens': agent_result.get('last_prompt_tokens', 0),",
+            "                'max_tokens': agent_result.get('context_length', 0),",
+            "            },",
+            "        )",
+            "        if _lark_card_sent:",
+            "            agent_result['already_sent'] = True",
+            "        elif on_message_needs_text_fallback(message_id=_lark_completion_id):",
+            "            agent_result.pop('already_sent', None)",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _modular_complete_hook(indent: str) -> str:
+    """Finalize the CardKit card before run_turn's normal final delivery."""
+    return _make_hook(
+        indent,
+        MK_COMPLETE,
+        MK_COMPLETE_END,
+        [
+            "try:",
+            "    _lark_p = str(getattr(getattr(source, 'platform', None), 'value', None) or getattr(source, 'platform', '') or getattr(event, 'platform', '')).lower()",
+            "    if 'feishu' in _lark_p or 'lark' in _lark_p:",
+            "        from hermes_lark_streaming.patch import on_message_completed_wait, on_message_needs_text_fallback",
+            "        _lark_completion_id = agent_result.get('_hermes_lark_completion_id') or event.message_id",
+            "        _lark_card_sent = await on_message_completed_wait(",
+            "            message_id=_lark_completion_id,",
+            "            answer=response,",
+            "            duration=_turn_seconds,",
+            "            model=agent_result.get('model', ''),",
+            "            tokens={",
+            "                'input_tokens': agent_result.get('input_tokens', 0),",
+            "                'output_tokens': agent_result.get('output_tokens', 0),",
+            "            },",
+            "            context={",
+            "                'used_tokens': agent_result.get('last_prompt_tokens', 0),",
+            "                'max_tokens': agent_result.get('context_length', 0),",
+            "            },",
+            "        )",
+            "        if _lark_card_sent:",
+            "            agent_result['already_sent'] = True",
+            "        elif on_message_needs_text_fallback(message_id=_lark_completion_id):",
+            "            agent_result.pop('already_sent', None)",
             "except Exception:",
             "    pass",
         ],
@@ -312,6 +373,75 @@ def _followup_result_hook(indent: str) -> str:
     )
 
 
+def _modular_followup_complete_hook(indent: str) -> str:
+    """Close the prior CardKit card before run_turn drains a non-interrupt queue item."""
+    return _make_hook(
+        indent,
+        MK_FOLLOWUP_COMPLETE,
+        MK_FOLLOWUP_COMPLETE_END,
+        [
+            "try:",
+            "    _lark_p = str(getattr(getattr(turn_ctx.source, 'platform', None), 'value', None) or getattr(turn_ctx.source, 'platform', '')).lower()",
+            "    if 'feishu' in _lark_p or 'lark' in _lark_p:",
+            "        from hermes_lark_streaming.patch import on_queued_followup_boundary",
+            "        await on_queued_followup_boundary(",
+            "            message_id=turn_ctx.inbound_message_id or turn_ctx.event_message_id or '',",
+            "            result=result,",
+            "        )",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _modular_followup_result_hook(indent: str) -> str:
+    return _make_hook(
+        indent,
+        MK_FOLLOWUP_RESULT,
+        MK_FOLLOWUP_RESULT_END,
+        [
+            "try:",
+            "    from hermes_lark_streaming.patch import on_queued_followup_result",
+            "    if next_inbound_id:",
+            "        on_queued_followup_result(",
+            "            message_id=next_inbound_id,",
+            "            followup_result=followup_result,",
+            "        )",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _modular_followup_delivery_hook(indent: str) -> str:
+    """Do not let the native queue sender duplicate a card already finalized above."""
+    return _make_hook(
+        indent,
+        MK_FOLLOWUP_DELIVERY,
+        MK_FOLLOWUP_DELIVERY_END,
+        [
+            "if isinstance(result, dict) and result.get('already_sent') and not result.get('failed'):",
+            "    _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)",
+            "    if callable(_bg_cb):",
+            "        with suppress(Exception):",
+            "            _bg_result = _bg_cb()",
+            "            if inspect.isawaitable(_bg_result):",
+            "                await _bg_result",
+            "    return",
+        ],
+    )
+
+
+def _legacy_followup_delivery_hook(indent: str) -> str:
+    """Marker retained for a uniform install state; legacy drain honors already_sent itself."""
+    return _make_hook(
+        indent,
+        MK_FOLLOWUP_DELIVERY,
+        MK_FOLLOWUP_DELIVERY_END,
+        ["# Legacy queue delivery observes result['already_sent'] after FOLLOWUP_COMPLETE."],
+    )
+
+
 def _tool_hook(indent: str) -> str:
     return _make_hook(
         indent,
@@ -343,7 +473,8 @@ def _answer_hook(indent: str) -> str:
         [
             "try:",
             "    from hermes_lark_streaming.patch import on_answer_delta",
-            "    if text and ctx._run_still_current() and on_answer_delta(message_id=ctx.event_message_id or '', text=text):",
+            "    if (text and ctx._run_still_current()",
+            "            and on_answer_delta(message_id=ctx.event_message_id or '', text=text)):",
             "        return",
             "except Exception:",
             "    pass",
@@ -417,8 +548,10 @@ def _abort_hook(indent: str) -> str:
         MK_ABORT_END,
         [
             "try:",
-            "    from hermes_lark_streaming.patch import on_message_aborted",
-            "    on_message_aborted(message_id=event.message_id)",
+            "    _lark_p = str(getattr(getattr(source, 'platform', None), 'value', None) or getattr(source, 'platform', '') or getattr(event, 'platform', '')).lower()",
+            "    if 'feishu' in _lark_p or 'lark' in _lark_p:",
+            "        from hermes_lark_streaming.patch import on_message_aborted",
+            "        on_message_aborted(message_id=event.message_id)",
             "except Exception:",
             "    pass",
         ],
@@ -432,26 +565,65 @@ def _interrupt_hook(indent: str) -> str:
         MK_INTERRUPT_END,
         [
             "try:",
-            "    from hermes_lark_streaming.patch import (",
-            "        on_message_aborted, on_message_interrupted, on_message_started,",
-            "    )",
-            "    _lark_next_message_id = getattr(pending_event, 'message_id', None) or next_message_id",
-            "    _lark_next_anchor_id = next_message_id",
-            "    if was_interrupted and _lark_next_message_id:",
-            "        on_message_interrupted(",
-            "            message_id=event_message_id,",
-            "            new_message_id=_lark_next_message_id,",
-            "            chat_id=source.chat_id,",
-            "            anchor_id=_lark_next_anchor_id,",
+            "    _lark_p = str(getattr(getattr(source, 'platform', None), 'value', None) or getattr(source, 'platform', '')).lower()",
+            "    if 'feishu' in _lark_p or 'lark' in _lark_p:",
+            "        from hermes_lark_streaming.patch import (",
+            "            on_message_aborted, on_message_interrupted, on_message_started,",
             "        )",
-            "    elif was_interrupted:",
-            "        on_message_aborted(message_id=event_message_id)",
-            "    elif pending_event is not None and _lark_next_message_id:",
-            "        on_message_started(",
-            "            message_id=_lark_next_message_id,",
-            "            chat_id=getattr(next_source, 'chat_id', source.chat_id),",
-            "            anchor_id=_lark_next_anchor_id,",
+            "        _lark_next_message_id = getattr(pending_event, 'message_id', None) or next_message_id",
+            "        _lark_next_anchor_id = next_message_id",
+            "        if was_interrupted and _lark_next_message_id:",
+            "            on_message_interrupted(",
+            "                message_id=event_message_id,",
+            "                new_message_id=_lark_next_message_id,",
+            "                chat_id=source.chat_id,",
+            "                anchor_id=_lark_next_anchor_id,",
+            "            )",
+            "        elif was_interrupted:",
+            "            on_message_aborted(message_id=event_message_id)",
+            "        elif pending_event is not None and _lark_next_message_id:",
+            "            on_message_started(",
+            "                message_id=_lark_next_message_id,",
+            "                chat_id=getattr(next_source, 'chat_id', source.chat_id),",
+            "                anchor_id=_lark_next_anchor_id,",
+            "                platform=_lark_p,",
+            "            )",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _modular_interrupt_hook(indent: str) -> str:
+    """Map run_turn's raw inbound IDs onto CardKit sessions during recursive drains."""
+    return _make_hook(
+        indent,
+        MK_INTERRUPT,
+        MK_INTERRUPT_END,
+        [
+            "try:",
+            "    _lark_p = str(getattr(getattr(next_source, 'platform', None), 'value', None) or getattr(next_source, 'platform', '')).lower()",
+            "    if 'feishu' in _lark_p or 'lark' in _lark_p:",
+            "        from hermes_lark_streaming.patch import (",
+            "            on_message_aborted, on_message_interrupted, on_message_started,",
             "        )",
+            "        _lark_old_message_id = turn_ctx.inbound_message_id or turn_ctx.event_message_id or ''",
+            "        if result.get('interrupted') and next_inbound_id:",
+            "            on_message_interrupted(",
+            "                message_id=_lark_old_message_id,",
+            "                new_message_id=next_inbound_id,",
+            "                chat_id=next_source.chat_id,",
+            "                anchor_id=next_message_id,",
+            "            )",
+            "        elif result.get('interrupted'):",
+            "            on_message_aborted(message_id=_lark_old_message_id)",
+            "        elif pending_event is not None and next_inbound_id:",
+            "            on_message_started(",
+            "                message_id=next_inbound_id,",
+            "                chat_id=next_source.chat_id,",
+            "                anchor_id=next_message_id,",
+            "                platform=_lark_p,",
+            "            )",
             "except Exception:",
             "    pass",
         ],
@@ -482,6 +654,36 @@ def _cron_deliver_hook(indent: str) -> str:
             "        ):",
             "            _hermes_lark_cron_seen.add(_hermes_lark_cron_key)",
             "            delivered = True",
+            "            continue",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _modular_cron_deliver_hook(indent: str) -> str:
+    """Intercept the scheduler_delivery target loop before either native send lane runs."""
+    return _make_hook(
+        indent,
+        MK_CRON_DELIVER,
+        MK_CRON_DELIVER_END,
+        [
+            "try:",
+            "    if t.platform_name.lower() in ('feishu', 'lark'):",
+            "        if '_hermes_lark_cron_seen' not in locals():",
+            "            _hermes_lark_cron_seen = set()",
+            "        _hermes_lark_cron_key = (str(t.chat_id), cleaned_delivery_content.strip())",
+            "        if _hermes_lark_cron_key in _hermes_lark_cron_seen:",
+            "            continue",
+            "        from hermes_lark_streaming.patch import on_cron_deliver",
+            "        if on_cron_deliver(",
+            "            chat_id=t.chat_id,",
+            "            content=cleaned_delivery_content.strip(),",
+            "            loop=t.loop,",
+            "            task_name=job.get('name', ''),",
+            "            run_time=job.get('next_run_at', ''),",
+            "        ):",
+            "            _hermes_lark_cron_seen.add(_hermes_lark_cron_key)",
             "            continue",
             "except Exception:",
             "    pass",
@@ -565,15 +767,42 @@ class Patcher:
                 f"(tried: {tried}). "
                 f"Set HERMES_HOME to the dir containing hermes-agent/ and rerun."
             )
+        gateway_dir = self.run_path.parent
+        modular_paths = {
+            "inbound": gateway_dir / "run_inbound.py",
+            "turn": gateway_dir / "run_turn.py",
+            "runner": gateway_dir / "run_turn_runner.py",
+        }
+        self._is_modular = all(path.is_file() for path in modular_paths.values())
+        self._paths: dict[str, Path] = modular_paths if self._is_modular else {"run": self.run_path}
 
     def is_patched(self) -> bool:
-        return MK_START in self.run_path.read_text(encoding="utf-8")
+        return any(
+            begin in path.read_text(encoding="utf-8")
+            for path in self._paths.values()
+            for begin, _ in self.MARKERS
+        )
+
+    @property
+    def target_paths(self) -> tuple[Path, ...]:
+        """Concrete files carrying gateway hooks (one legacy file or split v2026.9 modules)."""
+        return tuple(self._paths.values())
 
     def is_fully_patched(self) -> bool:
-        content = self.run_path.read_text(encoding="utf-8")
-        return all(begin in content and end in content for begin, end in self.MARKERS)
+        if not self._is_modular:
+            content = self.run_path.read_text(encoding="utf-8")
+            return all(begin in content and end in content for begin, end in self.MARKERS)
+        marker_paths = self._modular_marker_paths()
+        return all(
+            begin in marker_paths[begin].read_text(encoding="utf-8")
+            and end in marker_paths[begin].read_text(encoding="utf-8")
+            for begin, end in self.MARKERS
+        )
 
     def verify_target(self) -> None:
+        if self._is_modular:
+            self._verify_modular_target()
+            return
         content = self.run_path.read_text(encoding="utf-8")
         tree = ast.parse(content)
 
@@ -630,6 +859,14 @@ class Patcher:
             return
 
         self.verify_target()
+        if self._is_modular:
+            if self.is_patched():
+                self._remove_all_blocks()
+            else:
+                self._backup()
+            for path, content in self._inject_modular_all().items():
+                _atomic_write(path, content)
+            return
         content = self.run_path.read_text(encoding="utf-8")
         if self.is_patched():
             for begin, end in self.MARKERS:
@@ -640,6 +877,9 @@ class Patcher:
         _atomic_write(self.run_path, content)
 
     def remove(self) -> None:
+        if self._is_modular:
+            self._remove_all_blocks()
+            return
         content = self.run_path.read_text(encoding="utf-8")
         if not any(begin in content for begin, _ in self.MARKERS):
             return
@@ -648,15 +888,154 @@ class Patcher:
         _atomic_write(self.run_path, content)
 
     def restore(self) -> None:
-        backup = self.run_path.with_suffix(self.run_path.suffix + _BACKUP_SUFFIX)
-        if not backup.exists():
-            raise PatcherError(f"No backup found: {backup}")
-        shutil.copy2(backup, self.run_path)
+        for path in self._paths.values():
+            backup = path.with_suffix(path.suffix + _BACKUP_SUFFIX)
+            if not backup.exists():
+                raise PatcherError(f"No backup found: {backup}")
+        for path in self._paths.values():
+            backup = path.with_suffix(path.suffix + _BACKUP_SUFFIX)
+            shutil.copy2(backup, path)
 
     def _backup(self) -> None:
-        backup = self.run_path.with_suffix(self.run_path.suffix + _BACKUP_SUFFIX)
-        if not backup.exists():
-            shutil.copy2(self.run_path, backup)
+        for path in self._paths.values():
+            backup = path.with_suffix(path.suffix + _BACKUP_SUFFIX)
+            if not backup.exists():
+                shutil.copy2(path, backup)
+
+    def _remove_all_blocks(self) -> None:
+        """Remove every known block from every concrete module (safe for partial installs)."""
+        for path in self._paths.values():
+            content = path.read_text(encoding="utf-8")
+            updated = content
+            for begin, end in self.MARKERS:
+                updated = _remove_block(updated, begin, end)
+            if updated != content:
+                _atomic_write(path, updated)
+
+    def _modular_marker_paths(self) -> dict[str, Path]:
+        return {
+            MK_NORMALIZE: self._paths["inbound"],
+            MK_START: self._paths["turn"],
+            MK_COMPLETE: self._paths["turn"],
+            MK_FOLLOWUP_COMPLETE: self._paths["turn"],
+            MK_FOLLOWUP_RESULT: self._paths["turn"],
+            MK_FOLLOWUP_DELIVERY: self._paths["turn"],
+            MK_ABORT: self._paths["turn"],
+            MK_INTERRUPT: self._paths["turn"],
+            MK_TOOL: self._paths["runner"],
+            MK_ANSWER: self._paths["runner"],
+            MK_THINKING: self._paths["runner"],
+            MK_REASONING: self._paths["runner"],
+            MK_BACKGROUND_REVIEW: self._paths["runner"],
+            MK_BG_DELIVER: self._paths["turn"],
+        }
+
+    def _modular_sources(self) -> dict[str, tuple[ast.Module, list[str]]]:
+        return {
+            name: (
+                ast.parse(path.read_text(encoding="utf-8")),
+                path.read_text(encoding="utf-8").splitlines(keepends=True),
+            )
+            for name, path in self._paths.items()
+        }
+
+    def _modular_sites(self) -> dict[str, tuple[str, tuple[int, str] | None]]:
+        """Locate v2026.9 module anchors by behavior, not their old run.py coordinates."""
+        sources = self._modular_sources()
+        inbound_tree, inbound_lines = sources["inbound"]
+        turn_tree, turn_lines = sources["turn"]
+        runner_tree, runner_lines = sources["runner"]
+        return {
+            "normalize": ("inbound", _find_source_site(inbound_tree, inbound_lines, "_hm_admit_event")),
+            "start": ("turn", _find_func_body(turn_tree, turn_lines, "_handle_message_with_agent")),
+            "complete": (
+                "turn", _find_line_site(turn_lines, "return await self._hmwa_deliver_turn_response(")
+            ),
+            "followup_complete": ("turn", _find_line_site(turn_lines, "if not result.get(\"interrupted\"):")),
+            "followup_result": (
+                "turn",
+                _find_line_site(
+                    turn_lines, "merged = _preserve_queued_followup_history_offset(result, followup_result)"
+                ),
+            ),
+            "followup_delivery": (
+                "turn",
+                _find_line_site(
+                    turn_lines, "_delivery_result = response if isinstance(response, dict) else (result or {})"
+                ),
+            ),
+            "abort": (
+                "turn",
+                _find_line_site(turn_lines, "self._hmwa_discard_stale_result(source, _quick_key, run_generation)"),
+            ),
+            "interrupt": (
+                "turn",
+                _find_line_site(turn_lines, "# Restart the typing indicator; the outer typing task may be stale."),
+            ),
+            "tool": ("runner", _find_func_body(runner_tree, runner_lines, "progress_callback")),
+            "answer": ("runner", _find_line_site(runner_lines, "for sink in delta_sinks:")),
+            "thinking": ("runner", _find_func_body(runner_tree, runner_lines, "interim_assistant_cb")),
+            "reasoning": (
+                "runner",
+                _find_line_site(
+                    runner_lines,
+                    "agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier",
+                ),
+            ),
+            "background_review": (
+                "runner",
+                _find_line_site(
+                    runner_lines,
+                    "agent.background_review_callback, bg_release = self._make_bg_review_callbacks()",
+                    after=1,
+                ),
+            ),
+            "bg_deliver": (
+                "turn", _find_line_site(turn_lines, "images, text_content = adapter.extract_images(response)", after=1)
+            ),
+        }
+
+    def _verify_modular_target(self) -> None:
+        missing = [str(path) for path in self._paths.values() if not path.is_file()]
+        if missing:
+            raise PatcherError(f"Missing Hermes modular gateway files: {', '.join(missing)}")
+        sites = self._modular_sites()
+        for name, (_, location) in sites.items():
+            if location is None:
+                raise PatcherError(
+                    f"Cannot find {name} anchor in Hermes modular gateway files — Hermes version may be incompatible"
+                )
+
+    def _inject_modular_all(self) -> dict[Path, str]:
+        sources = self._modular_sources()
+        lines_by_module = {name: lines for name, (_, lines) in sources.items()}
+        sites = self._modular_sites()
+        hook_fns = {
+            "normalize": _feishu_normalize_hook,
+            "start": _start_hook,
+            "complete": _modular_complete_hook,
+            "followup_complete": _modular_followup_complete_hook,
+            "followup_result": _modular_followup_result_hook,
+            "followup_delivery": _modular_followup_delivery_hook,
+            "abort": _abort_hook,
+            "interrupt": _modular_interrupt_hook,
+            "tool": _tool_hook,
+            "answer": _answer_hook,
+            "thinking": _thinking_hook,
+            "reasoning": _reasoning_hook,
+            "background_review": _background_review_hook,
+            "bg_deliver": _bg_deliver_hook,
+        }
+        pending: dict[str, list[tuple[int, str, str]]] = {name: [] for name in lines_by_module}
+        for name, (module, location) in sites.items():
+            if location is None:
+                raise PatcherError(f"Cannot locate {name} injection site — Hermes version may be incompatible")
+            pending[module].append((location[0], location[1], name))
+        for module, module_sites in pending.items():
+            lines = lines_by_module[module]
+            for index, indent, name in sorted(module_sites, reverse=True):
+                lines[index:index] = hook_fns[name](indent).splitlines(keepends=True)
+        return {self._paths[module]: "".join(lines) for module, lines in lines_by_module.items()}
 
     def _inject_all(self, content: str) -> str:
         tree = ast.parse(content)
@@ -668,6 +1047,7 @@ class Patcher:
             ("complete", "complete", _find_handler_return(tree, lines)),
             ("followup_complete", "followup_complete", _find_followup_complete_site(tree, lines)),
             ("followup_result", "followup_result", _find_followup_result_site(tree, lines)),
+            ("followup_delivery", "followup_delivery", _find_followup_complete_site(tree, lines)),
             ("abort", "abort", _find_handler_abort(tree, lines)),
             ("interrupt", "interrupt", _find_interrupt_site(tree, lines)),
             ("tool", "tool", _find_func_body(tree, lines, "progress_callback")),
@@ -694,6 +1074,7 @@ class Patcher:
             "complete": _complete_hook,
             "followup_complete": _followup_complete_hook,
             "followup_result": _followup_result_hook,
+            "followup_delivery": _legacy_followup_delivery_hook,
             "abort": _abort_hook,
             "interrupt": _interrupt_hook,
             "tool": _tool_hook,
@@ -752,9 +1133,21 @@ def _find_answer_delta_site(lines: list[str]) -> tuple[int, str] | None:
     return None
 
 
-def _find_handle_message_source_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+def _find_line_site(lines: list[str], needle: str, *, after: int = 0) -> tuple[int, str] | None:
+    """Return a stable insertion point at (or just after) an exact modular source anchor."""
+    for index, line in enumerate(lines):
+        if line.strip() == needle:
+            target = index + after
+            return target, _safe_indent(lines, index)
+    return None
+
+
+def _find_source_site(
+    tree: ast.Module, lines: list[str], function_name: str,
+) -> tuple[int, str] | None:
+    """Find ``source = event.source`` inside a specific inbound function."""
     for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_handle_message":
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name:
             for stmt in node.body:
                 if (
                     isinstance(stmt, ast.Assign)
@@ -769,6 +1162,10 @@ def _find_handle_message_source_site(tree: ast.Module, lines: list[str]) -> tupl
                     lineno = stmt.end_lineno or stmt.lineno
                     return lineno, _safe_indent(lines, stmt.lineno - 1)
     return None
+
+
+def _find_handle_message_source_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    return _find_source_site(tree, lines, "_handle_message")
 
 
 def _find_handler_return(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
@@ -862,7 +1259,7 @@ def _safe_indent(lines: list[str], lineno: int) -> str:
 
 
 class CronPatcher:
-    """注入 CRON_DELIVER hook 到 cron/scheduler.py 的 _deliver_result."""
+    """Inject CRON_DELIVER into scheduler.py or modular scheduler_delivery.py."""
 
     def __init__(self, cron_path: Path | None = None) -> None:
         self.cron_path = cron_path or _default_cron_path()
@@ -873,12 +1270,37 @@ class CronPatcher:
                 f"(tried: {tried}). "
                 f"Set HERMES_HOME to the dir containing hermes-agent/ and rerun."
             )
+        delivery_path = self.cron_path.parent / "scheduler_delivery.py"
+        self._is_modular = (
+            delivery_path.is_file()
+            and "def _deliver_result(" in delivery_path.read_text(encoding="utf-8")
+        )
+        self._target_path = delivery_path if self._is_modular else self.cron_path
 
     def is_patched(self) -> bool:
-        return MK_CRON_DELIVER in self.cron_path.read_text(encoding="utf-8")
+        return MK_CRON_DELIVER in self._target_path.read_text(encoding="utf-8")
+
+    @property
+    def target_path(self) -> Path:
+        """Concrete scheduler file carrying the hook (scheduler_delivery.py when split)."""
+        return self._target_path
 
     def verify_target(self) -> None:
-        content = self.cron_path.read_text(encoding="utf-8")
+        content = self._target_path.read_text(encoding="utf-8")
+        if self._is_modular:
+            if "def _deliver_result(" not in content:
+                raise PatcherError("Cannot find _deliver_result in scheduler_delivery.py")
+            for anchor in (
+                "t = _prepare_target_delivery(",
+                "t.platform_name",
+                "cleaned_delivery_content",
+                "_deliver_via_live_adapter(",
+            ):
+                if anchor not in content:
+                    raise PatcherError(
+                        f"Cannot find {anchor!r} anchor in scheduler_delivery.py — Hermes version may be incompatible"
+                    )
+            return
         if "delivered = False" not in content:
             raise PatcherError("Cannot find 'delivered = False' anchor in scheduler.py")
         if "cleaned_delivery_content" not in content:
@@ -889,35 +1311,41 @@ class CronPatcher:
             return
         self.verify_target()
         self._backup()
-        lines = self.cron_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        lines = self._target_path.read_text(encoding="utf-8").splitlines(keepends=True)
 
         inject_idx = None
-        for i, line in enumerate(lines):
-            if line.strip() == "delivered = False":
-                inject_idx = i
-                break
+        if self._is_modular:
+            for i, line in enumerate(lines):
+                if line.strip() == "delivered = t.live_adapter_ready and _deliver_via_live_adapter(":
+                    inject_idx = i
+                    break
+        else:
+            for i, line in enumerate(lines):
+                if line.strip() == "delivered = False":
+                    inject_idx = i
+                    break
         if inject_idx is None:
-            raise PatcherError("Cannot find 'delivered = False' anchor")
+            raise PatcherError("Cannot find cron delivery injection anchor")
 
         indent = _safe_indent(lines, inject_idx)
-        hook = _cron_deliver_hook(indent)
-        lines[inject_idx + 1 : inject_idx + 1] = hook.splitlines(keepends=True)
-        _atomic_write(self.cron_path, "".join(lines))
+        hook = _modular_cron_deliver_hook(indent) if self._is_modular else _cron_deliver_hook(indent)
+        lines[inject_idx:inject_idx] = hook.splitlines(keepends=True)
+        _atomic_write(self._target_path, "".join(lines))
 
     def remove(self) -> None:
-        content = self.cron_path.read_text(encoding="utf-8")
+        content = self._target_path.read_text(encoding="utf-8")
         if MK_CRON_DELIVER not in content:
             return
         content = _remove_block(content, MK_CRON_DELIVER, MK_CRON_DELIVER_END)
-        _atomic_write(self.cron_path, content)
+        _atomic_write(self._target_path, content)
 
     def restore(self) -> None:
-        backup = self.cron_path.with_suffix(self.cron_path.suffix + _BACKUP_SUFFIX)
+        backup = self._target_path.with_suffix(self._target_path.suffix + _BACKUP_SUFFIX)
         if not backup.exists():
             raise PatcherError(f"No backup found: {backup}")
-        shutil.copy2(backup, self.cron_path)
+        shutil.copy2(backup, self._target_path)
 
     def _backup(self) -> None:
-        backup = self.cron_path.with_suffix(self.cron_path.suffix + _BACKUP_SUFFIX)
+        backup = self._target_path.with_suffix(self._target_path.suffix + _BACKUP_SUFFIX)
         if not backup.exists():
-            shutil.copy2(self.cron_path, backup)
+            shutil.copy2(self._target_path, backup)

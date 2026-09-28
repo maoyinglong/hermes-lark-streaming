@@ -42,7 +42,7 @@ def _print_usage() -> None:
     print("Usage: python -m hermes_lark_streaming <command>")
     print()
     print("Commands:")
-    print("  install    Apply AST patch to gateway/run.py and cron/scheduler.py")
+    print("  install    Apply AST patch to Hermes gateway and cron delivery modules")
     print("  uninstall  Remove AST patch")
     print("  restore    Restore from backup")
     print("  status     Show current patch status")
@@ -162,19 +162,23 @@ def _cmd_status() -> int:
     patched = patcher.is_patched()
     print(f"Patched: {'yes' if patched else 'no'}")
     print(f"Target:  {patcher.run_path}")
+    if len(patcher.target_paths) > 1:
+        print("Hook modules:")
+        for path in patcher.target_paths:
+            print(f"  {path}")
 
     if patched:
         from .patcher import Patcher as _PatcherCls
 
-        content = patcher.run_path.read_text(encoding="utf-8")
         for begin, _end in _PatcherCls.MARKERS:
-            found = begin in content
+            found = any(begin in path.read_text(encoding="utf-8") for path in patcher.target_paths)
             label = begin.replace("# HERMES_LARK_", "").replace("_BEGIN", "").lower()
             print(f"  {label}: {'installed' if found else 'missing'}")
 
     cron_patcher = _get_cron_patcher()
     if cron_patcher is not None:
         print(f"Cron hook: {'installed' if cron_patcher.is_patched() else 'not installed'}")
+        print(f"Cron target: {cron_patcher.target_path}")
 
     # Check config
     from .config import Config
@@ -216,7 +220,7 @@ def _cmd_verify() -> int:
 
     cron_patcher = _get_cron_patcher()
     if cron_patcher is not None:
-        print(f"Cron target: {cron_patcher.cron_path}")
+        print(f"Cron target: {cron_patcher.target_path}")
         try:
             cron_patcher.verify_target()
         except Exception as e:

@@ -232,10 +232,16 @@ class TestBuildDisplayBlock:
         assert result is not None
         assert result["language"] == "json"
 
-    def test_fenced_block_has_fences(self) -> None:
+    def test_plain_text_block_has_no_fence(self) -> None:
         result = _build_display_block("some text")
         assert result is not None
-        assert "```" in result["fenced"]
+        assert result["fenced"] == "some text"
+
+    def test_plain_text_aliases_have_no_fence(self) -> None:
+        for language in ("text", "PLAIN_TEXT", "plaintext"):
+            result = _fenced_block(language, "hello")
+            assert result["language"] == "text"
+            assert result["fenced"] == "hello"
 
 
 class TestFencedBlock:
@@ -245,15 +251,15 @@ class TestFencedBlock:
         assert result["content"] == "print('hi')"
         assert result["fenced"].startswith("```python")
 
-    def test_fence_uses_minimum_triple(self) -> None:
+    def test_code_fence_uses_minimum_triple(self) -> None:
         # 内容中单反引号 → 最长连续 = 1, max(3, 1+1) = 3
-        result = _fenced_block("text", "some `code` here")
-        assert result["fenced"].startswith("```")
+        result = _fenced_block("python", "some `code` here")
+        assert result["fenced"].startswith("```python")
 
-    def test_fence_escalates_for_triple_backticks(self) -> None:
+    def test_code_fence_escalates_for_triple_backticks(self) -> None:
         content = "```existing fence```"
-        result = _fenced_block("text", content)
-        assert result["fenced"].startswith("````")
+        result = _fenced_block("python", content)
+        assert result["fenced"].startswith("````python")
 
 
 class TestToolUseTracker:

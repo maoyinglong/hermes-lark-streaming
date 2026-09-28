@@ -108,6 +108,9 @@ def test_not_found_diagnostic_lists_tried_roots(
     """找不到目标时报错列出所有尝试过的候选根 + HERMES_HOME 提示。"""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    # 隔离宿主机可能存在的 root-mode Hermes 安装；仍保留实际候选根，
+    # 以便验证诊断信息会列出全部尝试路径。
+    monkeypatch.setattr(patcher_mod, "_valid_source", lambda path: None)
     with pytest.raises(PatcherError) as exc_info:
         cls()
     msg = str(exc_info.value)

@@ -113,9 +113,25 @@ def on_feishu_normalize(
 
 
 @_safe_hook()
-def on_message_started(*, ctrl: Any, message_id: str, chat_id: str, anchor_id: str | None = None) -> None:
+def on_message_started(
+    *,
+    ctrl: Any,
+    message_id: str,
+    chat_id: str,
+    anchor_id: str | None = None,
+    platform: str | None = None,
+) -> None:
     """[注入点 1] 函数开头 — message.started."""
-    ctrl.on_message_started(message_id=message_id, chat_id=chat_id, anchor_id=anchor_id)
+    if platform:
+        p = str(platform).lower()
+        if "feishu" not in p and "lark" not in p:
+            return
+    ctrl.on_message_started(
+        message_id=message_id,
+        chat_id=chat_id,
+        anchor_id=anchor_id,
+        platform=platform,
+    )
 
 
 @_safe_hook(default_return=False)
@@ -195,7 +211,7 @@ def on_tool_updated(
     detail: str = "",
 ) -> bool:
     """[注入点 3] progress_callback — tool.updated."""
-    return bool(
+    handled = bool(
         ctrl.on_tool_update(
             message_id=message_id,
             tool_name=tool_name,
@@ -203,6 +219,14 @@ def on_tool_updated(
             detail=detail,
         )
     )
+    if not handled:
+        _logger.warning(
+            "on_tool_updated not handled: msg=%s tool=%s status=%s",
+            (message_id or "")[:12],
+            tool_name,
+            status,
+        )
+    return handled
 
 
 @_safe_hook(default_return=False, log_level="debug")

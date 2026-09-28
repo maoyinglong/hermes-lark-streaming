@@ -6,6 +6,7 @@ import asyncio
 import logging
 import threading
 import time
+import uuid
 from collections.abc import Callable, Coroutine
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Any
@@ -105,10 +106,15 @@ class StreamCardController(StreamingController):
         message_id: str | None,
         chat_id: str,
         anchor_id: str | None = None,
+        platform: str | None = None,
     ) -> None:
         """消息处理开始 — 创建会话 + 发占位卡片."""
         if not self.enabled:
             return
+        if platform:
+            p = str(platform).lower()
+            if "feishu" not in p and "lark" not in p:
+                return
         if not message_id:
             _logger.warning("on_message_started: missing message_id, chat=%s", chat_id[:12])
             return

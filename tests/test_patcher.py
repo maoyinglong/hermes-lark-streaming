@@ -94,6 +94,120 @@ def _cron_patcher(path: Path) -> CronPatcher:
     return CronPatcher(cron_path=path)
 
 
+@pytest.fixture()
+def modular_gateway_copy(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path]:
+    """A minimal v2026.9 split layout with every behavior-based patch anchor."""
+    gateway = tmp_path / "gateway"
+    cron = tmp_path / "cron"
+    gateway.mkdir()
+    cron.mkdir()
+    run = gateway / "run.py"
+    inbound = gateway / "run_inbound.py"
+    turn = gateway / "run_turn.py"
+    runner = gateway / "run_turn_runner.py"
+    scheduler = cron / "scheduler.py"
+    delivery = cron / "scheduler_delivery.py"
+    run.write_text("# Gateway assembly module\n", encoding="utf-8")
+    inbound.write_text(
+        textwrap.dedent("""\
+        class GatewayInboundMixin:
+            async def _hm_admit_event(self, event):
+                source = event.source
+                return event, source, False
+        """),
+        encoding="utf-8",
+    )
+    turn.write_text(
+        textwrap.dedent("""\
+        import inspect
+        from contextlib import suppress
+
+        class GatewayTurnMixin:
+            async def _handle_message_with_agent(self, event, source, _quick_key, run_generation):
+                agent_result = {}
+                response = ""
+                _turn_seconds = 0.0
+                self._hmwa_discard_stale_result(source, _quick_key, run_generation)
+                return await self._hmwa_deliver_turn_response(
+                    event, source, agent_result, response)
+
+            async def _run_background_task_inner(self, prompt, source, event_message_id):
+                response = ""
+                adapter = self._adapter_for_source(source)
+                images, text_content = adapter.extract_images(response)
+
+            async def _run_agent_deliver_first_response(self, turn_ctx, adapter, response, result, stream_task):
+                session_key = turn_ctx.session_key
+                _delivery_result = response if isinstance(response, dict) else (result or {})
+                return _delivery_result
+
+            async def _run_agent_queued_followup(
+                self, turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+            ):
+                next_source = source = turn_ctx.source
+                next_message_id = None
+                next_inbound_id = None
+                if pending_event is not None:
+                    next_source = pending_event.source
+                    next_message_id = self._reply_anchor_for_event(pending_event)
+                    next_inbound_id = pending_event.message_id
+                # Restart the typing indicator; the outer typing task may be stale.
+                if not result.get("interrupted"):
+                    await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+                followup_result = {}
+                merged = _preserve_queued_followup_history_offset(result, followup_result)
+                return merged
+        """),
+        encoding="utf-8",
+    )
+    runner.write_text(
+        textwrap.dedent("""\
+        class TurnRunner:
+            def progress_callback(self, event_type, tool_name=None, preview=None):
+                ctx = self._ctx
+                return ctx
+
+            def _setup_stream_consumer(self):
+                ctx = self._ctx
+                delta_sinks = []
+                def stream_delta_cb(text):
+                    if ctx._run_still_current():
+                        for sink in delta_sinks:
+                            sink.on_delta(text)
+                def interim_assistant_cb(text, *, already_streamed=False):
+                    if not ctx._run_still_current():
+                        return
+                return stream_delta_cb, interim_assistant_cb
+
+            def _wire_turn_agent_callbacks(self, agent, reasoning_config, runner):
+                ctx = self._ctx
+                agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
+                agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
+        """),
+        encoding="utf-8",
+    )
+    scheduler.write_text("from cron.scheduler_delivery import _deliver_result\n", encoding="utf-8")
+    delivery.write_text(
+        textwrap.dedent("""\
+        def _deliver_result(job, content, adapters=None, loop=None):
+            cleaned_delivery_content = content
+            targets = []
+            for target in targets:
+                t = _prepare_target_delivery(
+                    job, target, adapters=adapters, loop=loop)
+                if t is None:
+                    continue
+                if t.platform_name == "":
+                    continue
+                target_errors = []
+                delivered = t.live_adapter_ready and _deliver_via_live_adapter(
+                    t, cleaned_delivery_content, [], target_errors=target_errors)
+        """),
+        encoding="utf-8",
+    )
+    return run, inbound, turn, runner, scheduler
+
+
 def _build_cron_hook_runner():
     namespace: dict = {
         "job": {
@@ -266,7 +380,7 @@ class TestApplyRemove:
         assert "on_feishu_normalize(" in content
         assert "on_message_started(" in content
         assert "_lark_anchor_id = self._reply_anchor_for_event(event)" in content
-        assert "message_id=event.message_id or _lark_anchor_id" in content
+        assert "message_id=_lark_inbound_id" in content
         assert "anchor_id=_lark_anchor_id" in content
         assert "_lark_next_message_id = getattr(pending_event, 'message_id', None) or next_message_id" in content
         assert "new_message_id=_lark_next_message_id" in content
@@ -373,6 +487,37 @@ class TestBackupRestore:
             patcher.restore()
 
 
+class TestModularGatewayPatcher:
+    def test_verify_apply_compile_and_remove_split_modules(
+        self, modular_gateway_copy: tuple[Path, Path, Path, Path, Path]
+    ) -> None:
+        run, inbound, turn, runner, _ = modular_gateway_copy
+        patcher = _patcher(run)
+        originals = {path: path.read_text(encoding="utf-8") for path in (inbound, turn, runner)}
+
+        assert patcher._is_modular is True
+        patcher.verify_target()
+        patcher.apply()
+
+        for path in (inbound, turn, runner):
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        assert "# HERMES_LARK_NORMALIZE_BEGIN" in inbound.read_text(encoding="utf-8")
+        turn_text = turn.read_text(encoding="utf-8")
+        assert "# HERMES_LARK_FOLLOWUP_DELIVERY_BEGIN" in turn_text
+        assert "turn_ctx.inbound_message_id" in turn_text
+        runner_text = runner.read_text(encoding="utf-8")
+        assert "on_answer_delta" in runner_text
+        assert "on_reasoning_delta" in runner_text
+
+        first = {path: path.read_text(encoding="utf-8") for path in (inbound, turn, runner)}
+        patcher.apply()
+        assert first == {path: path.read_text(encoding="utf-8") for path in (inbound, turn, runner)}
+
+        patcher.remove()
+        patcher.remove()
+        assert originals == {path: path.read_text(encoding="utf-8") for path in (inbound, turn, runner)}
+
+
 # --- CronPatcher ---
 
 
@@ -473,6 +618,29 @@ class TestCronApplyRemove:
 
         assert mock_deliver.call_count == 2
         assert fallback == ["oc_same"]
+
+    def test_modular_scheduler_delivery_target(
+        self, modular_gateway_copy: tuple[Path, Path, Path, Path, Path]
+    ) -> None:
+        _, _, _, _, scheduler = modular_gateway_copy
+        delivery = scheduler.parent / "scheduler_delivery.py"
+        cp = _cron_patcher(scheduler)
+        original = delivery.read_text(encoding="utf-8")
+
+        assert cp._is_modular is True
+        assert cp._target_path == delivery
+        cp.verify_target()
+        cp.apply()
+        compile(delivery.read_text(encoding="utf-8"), str(delivery), "exec")
+        patched = delivery.read_text(encoding="utf-8")
+        assert "# HERMES_LARK_CRON_DELIVER_BEGIN" in patched
+        assert "t.platform_name.lower()" in patched
+
+        cp.apply()
+        assert delivery.read_text(encoding="utf-8") == patched
+        cp.remove()
+        cp.remove()
+        assert delivery.read_text(encoding="utf-8") == original
 
 
 class TestCronBackupRestore:
