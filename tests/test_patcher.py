@@ -597,14 +597,12 @@ class TestCronApplyRemove:
         ):
             fallback = deliver(targets, " failed ", object())
 
-        assert sent == [
-            (
-                "oc_same",
-                "failed",
-                "test",
-                "2026-06-10T14:30:00+08:00",
-            )
-        ]
+        assert len(sent) == 1
+        assert sent[0][:3] == ("oc_same", "failed", "test")
+        from datetime import datetime, timezone
+        run_time = datetime.fromisoformat(sent[0][3])
+        assert abs((datetime.now(timezone.utc) - run_time).total_seconds()) < 10
+        assert sent[0][3] != "2026-06-10T14:30:00+08:00"
         assert fallback == []
 
     def test_injected_hook_retries_duplicate_target_after_failure(self) -> None:
@@ -634,6 +632,8 @@ class TestCronApplyRemove:
         compile(delivery.read_text(encoding="utf-8"), str(delivery), "exec")
         patched = delivery.read_text(encoding="utf-8")
         assert "# HERMES_LARK_CRON_DELIVER_BEGIN" in patched
+        assert "run_time=__import__('datetime').datetime.now().astimezone().isoformat()" in patched
+        assert "run_time=job.get('next_run_at', '')" not in patched
         assert "t.platform_name.lower()" in patched
 
         cp.apply()
