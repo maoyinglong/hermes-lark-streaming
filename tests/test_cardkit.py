@@ -142,6 +142,85 @@ class TestSplitLongText:
         text = "a" * 2400
         assert len(_split_long_text(text)) == 1
 
+    def test_prose_whitespace_is_lossless(self) -> None:
+        text = ("中文🙂 " * 90 + "\n\n\n") * 20
+        parts = _split_long_text(text, 180)
+        assert "".join(parts) == text
+        assert all(0 < len(p) <= 180 for p in parts)
+
+    def test_fences_reopen_with_info_and_preserve_blank_lines(self) -> None:
+        for marker in ("```", "~~~~", "````"):
+            body = ("first\n\n\nsecond\n``` embedded\n" * 120)
+            text = marker + "python\n" + body + marker + "\n"
+            parts = _split_long_text(text, 240)
+            assert len(parts) > 1
+            assert all(len(p) <= 240 for p in parts)
+            assert all(p.startswith(marker + "python\n") for p in parts)
+            assert all(p.rstrip("\n").endswith(marker) for p in parts)
+            recovered = "".join(p[len(marker + "python\n") : p.rfind(marker)] for p in parts)
+            assert recovered == body
+
+    def test_short_code_block_moved_intact(self) -> None:
+        block = "```py\nx = 1\n\n\ny = 2\n```\n"
+        parts = _split_long_text("a" * 100 + "\n" + block + "z" * 120, 128)
+        assert any(block in p for p in parts)
+        assert "".join(parts) == "a" * 100 + "\n" + block + "z" * 120
+
+    def test_long_code_line_and_unclosed_fence_are_bounded(self) -> None:
+        for closing in ("", "\n``````\n"):
+            parts = _split_long_text("```js\n" + "x" * 10000 + closing, 128)
+            assert all(len(p) <= 128 for p in parts)
+            assert all(p.startswith("```js\n") and p.rstrip("\n").endswith("```") for p in parts)
+            assert sum(p.count("x") for p in parts) == 10000
+
+    def test_table_continuations_repeat_header_without_losing_rows(self) -> None:
+        for header in ("| A | B |\n|:---|---:|\n", "A | B\n--- | ---\n"):
+            rows = [f"| row-{i:03d} | value |\n" for i in range(100)]
+            parts = _split_long_text(header + "".join(rows), 240)
+            assert all(p.startswith(header) and len(p) <= 240 for p in parts)
+            assert "".join(p[len(header):] for p in parts) == "".join(rows)
+
+    def test_inline_constructs_are_atomic(self) -> None:
+        for atom in (
+            "**bold words**", "*italic words*", "__strong__", "~~strike~~",
+            "``a ` b``", "[label](https://example.com/a_(b))", "![a](img_test)",
+            "<https://example.com>", "\\*",
+        ):
+            text = "x" * 115 + atom + "y" * 150
+            parts = _split_long_text(text, 128)
+            assert any(atom in p for p in parts)
+            assert "".join(parts) == text
+            assert all(len(p) <= 128 for p in parts)
+
+    def test_oversized_inline_and_table_row_use_bounded_literal(self) -> None:
+        for source in ("**" + "z" * 1000 + "**", "[x](https://" + "z" * 1000 + ")",
+                       "| A | B |\n|---|---|\n| " + "z" * 1000 + " | b |\n"):
+            parts = _split_long_text(source, 128)
+            assert all(len(p) <= 128 for p in parts)
+            assert all(p.startswith("```\n") and p.endswith("```") for p in parts)
+            assert sum(p.count("z") for p in parts) == 1000
+
+    def test_small_limit_rejected(self) -> None:
+        import pytest
+
+        for limit in (0, -1, 8):
+            with pytest.raises(ValueError):
+                _split_long_text("long", limit)
+
+    def test_complete_card_retains_fenced_blank_lines(self) -> None:
+        for marker in ("```", "~~~"):
+            body = "# code heading\n\n\nprint(1)\n" * 200
+            text = marker + "python\n" + body + marker
+            assert optimize_markdown_style(text) == text
+            card = build_complete_card(
+                segments=[_seg("answer", text)], all_tool_steps=[], footer_enabled=False,
+            )
+            parts = [e["content"] for e in card["body"]["elements"]]
+            assert len(parts) > 1
+            assert all(len(p) <= 2400 for p in parts)
+            assert "".join(p[len(marker + "python\n"):p.rfind(marker)] for p in parts) == body
+
+
 
 # --- 工具面板 ---
 
