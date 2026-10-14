@@ -544,6 +544,25 @@ def build_cron_card(
     content: str, *, task_name: str = "", run_time: str = ""
 ) -> dict[str, Any]:
     """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容."""
+    # 仅剥离调度器精确包装，保留业务正文及后续对话能力。
+    content = re.sub(
+        r'\ACronjob Response: [^\n]+\n\(job_id: [a-zA-Z0-9_-]+\)\n-{5,}\s*',
+        '', content,
+    )
+    content = re.sub(
+        r'\n\nTo stop or manage this job, send me a new message '
+        r'\(e\.g\. "stop reminder [^\n]+"\)\.\s*\Z',
+        '', content,
+    )
+    titles = {
+        'xue-video-daily-curator': '📺 每日技术视频精选',
+        'xue-rss-daily-2200': '📰 每日技术情报',
+        'xue-community-daily-curator-2135': '🌐 社区精选选题',
+        'xue-hostdare-proxy-watchdog': '🛡️ oc 连通性告警',
+    }
+    task_name = titles.get(task_name, task_name)
+    if task_name.startswith('每周日凌晨 0:00 执行。调用 xue-study-report'):
+        task_name = '📚 AI 智能体研习周报'
     card: dict[str, Any] = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "locales": _LOCALES},
