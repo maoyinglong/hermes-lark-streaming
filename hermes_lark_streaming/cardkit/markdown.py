@@ -13,6 +13,8 @@ _MAX_CHUNK_CHARS = 2400
 __all__ = [
     "_downgrade_tables",
     "_find_tables_outside_code_blocks",
+    "_normalize_indented_blockquotes",
+    "_sanitize_math_symbols",
     "_split_long_text",
     "_strip_invalid_image_keys",
     "optimize_markdown_style",
@@ -58,14 +60,58 @@ def _strip_invalid_image_keys(text: str) -> str:
     return re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", _replace, text)
 
 
+def _sanitize_math_symbols(text: str) -> str:
+    """清洗飞书 CardKit 不支持的 LaTeX 箭头及数学符号，转为纯文本 Unicode 符号."""
+    text = re.sub(r"\$(?:\\to|\\rightarrow)\$", "→", text)
+    text = re.sub(r"(?<!\\)\\(?:to|rightarrow)\b", "→", text)
+    text = re.sub(r"\$(?:\\gets|\\leftarrow)\$", "←", text)
+    text = re.sub(r"(?<!\\)\\(?:gets|leftarrow)\b", "←", text)
+    text = re.sub(r"\$\\leftrightarrow\$", "↔", text)
+    text = re.sub(r"\$\\Rightarrow\$", "⇒", text)
+    text = re.sub(r"\$\\Leftarrow\$", "⇐", text)
+    text = re.sub(r"\$\\Leftrightarrow\$", "⇔", text)
+    return text
+
+
+def _normalize_indented_blockquotes(text: str) -> str:
+    """将嵌套在列表或缩进中的引用块 (如 '   > text') 顶格化为标准引用 ('> text').
+
+    飞书 CardKit 富文本组件不支持缩进的 blockquote，遇到行首带空格的 '>' 会导致 AST 解析失败而静默吞掉内容。
+    将其规整为顶格的独立引用块，并确保前后有换行分隔。
+    """
+    lines = text.split("\n")
+    new_lines: list[str] = []
+    in_quote = False
+
+    for line in lines:
+        m = re.match(r"^[ \t]+>(?:[ \t]?(.*))?$", line)
+        if m:
+            content = m.group(1) if m.group(1) is not None else ""
+            if not in_quote:
+                if new_lines and new_lines[-1].strip() != "":
+                    new_lines.append("")
+                in_quote = True
+            new_lines.append(f"> {content}".rstrip() if content else ">")
+        else:
+            if in_quote:
+                if line.strip() != "":
+                    new_lines.append("")
+                in_quote = False
+            new_lines.append(line)
+
+    return "\n".join(new_lines)
+
+
 def optimize_markdown_style(text: str) -> str:
     """优化流式 Markdown 以适配飞书 CardKit 渲染.
 
     1. 提取代码块用占位符保护
     2. 标题降级: H1 -> H4, H2-H6 -> H5
-    3. 还原代码块
-    4. 压缩多余空行
-    5. 剥离无效图片 key（非 img_xxx 格式）
+    3. 数学符号与 LaTeX 消毒（如 $\\to$ -> →）
+    4. 缩进引用块顶格规整（防飞书 CardKit AST 吞字）
+    5. 压缩多余空行
+    6. 还原代码块
+    7. 剥离无效图片 key（非 img_xxx 格式）
     """
     try:
         # 1. 提取代码块
@@ -90,14 +136,20 @@ def optimize_markdown_style(text: str) -> str:
             r = re.sub(r"^#{2,6} (.+)$", r"##### \1", r, flags=re.MULTILINE)
             r = re.sub(r"^# (.+)$", r"#### \1", r, flags=re.MULTILINE)
 
-        # 3. Compress prose only; blank lines inside code are significant.
+        # 3. 数学符号与 LaTeX 消毒
+        r = _sanitize_math_symbols(r)
+
+        # 4. 缩进引用块顶格规整
+        r = _normalize_indented_blockquotes(r)
+
+        # 5. Compress prose only; blank lines inside code are significant.
         r = re.sub(r"\n{3,}", "\n\n", r)
 
-        # 4. Restore code after prose normalization.
+        # 6. Restore code after prose normalization.
         for i, block in enumerate(code_blocks):
             r = r.replace(f"{mark}{i}___", block)
 
-        # 5. 剥离无效图片 key
+        # 7. 剥离无效图片 key
         r = _strip_invalid_image_keys(r)
 
         return r

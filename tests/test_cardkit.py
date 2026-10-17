@@ -20,6 +20,8 @@ from hermes_lark_streaming.cardkit.builder import (
 from hermes_lark_streaming.cardkit.markdown import (
     _downgrade_tables,
     _find_tables_outside_code_blocks,
+    _normalize_indented_blockquotes,
+    _sanitize_math_symbols,
     _split_long_text,
     _strip_invalid_image_keys,
     optimize_markdown_style,
@@ -70,6 +72,17 @@ class TestOptimizeMarkdownStyle:
         result = optimize_markdown_style(text)
         assert "#### Title" in result
         assert "# Code heading" in result
+
+    def test_sanitize_math_symbols(self) -> None:
+        text = "A $\\to$ B and C \\rightarrow D"
+        result = optimize_markdown_style(text)
+        assert "A → B and C → D" in result
+
+    def test_normalize_indented_blockquotes(self) -> None:
+        text = "1. Item\n   > Indented quote line 1\n   > Indented quote line 2\n2. Next item"
+        result = optimize_markdown_style(text)
+        assert "> Indented quote line 1\n> Indented quote line 2" in result
+        assert "   >" not in result
 
 
 class TestStripInvalidImageKeys:
