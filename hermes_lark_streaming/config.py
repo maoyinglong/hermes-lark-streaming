@@ -167,6 +167,20 @@ class Config:
             pf = raw.get(key)
             if isinstance(pf, dict) and pf.get("app_id"):
                 return pf
+        # 兼容 v0.22.x+ 架构：凭据迁移至 gateway.feishu / gateway.lark
+        gw = raw.get("gateway")
+        if isinstance(gw, dict):
+            for key in ("feishu", "lark"):
+                pf = gw.get(key)
+                if isinstance(pf, dict) and pf.get("app_id"):
+                    return pf
+        # 兼容 platforms.feishu / platforms.lark
+        pfs = raw.get("platforms")
+        if isinstance(pfs, dict):
+            for key in ("feishu", "lark"):
+                pf = pfs.get(key)
+                if isinstance(pf, dict) and pf.get("app_id"):
+                    return pf
         return {}
 
     def _load(self) -> dict[str, Any]:
