@@ -7,10 +7,11 @@ Usage:
 from __future__ import annotations
 
 import ast
+import os
 import shutil
 import textwrap
-import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,65 +25,56 @@ from hermes_lark_streaming.patcher import (
     PatcherError,
     _cron_deliver_hook,
     _find_answer_delta_site,
+    _modular_complete_hook,
     _remove_block,
+    _start_hook,
 )
 
-RUN_SRC = Path.home() / ".hermes" / "hermes-agent" / "gateway" / "run.py"
-RUN_BAK = RUN_SRC.with_suffix(RUN_SRC.suffix + ".hermes_lark.bak")
-SAMPLES_DIR = Path(__file__).parent / "samples"
-SAMPLE_RUN = SAMPLES_DIR / "run.py"
-
-_RUN_URL = "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/gateway/run.py"
-_CRON_URL = "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/cron/scheduler.py"
-
-CRON_SRC = Path.home() / ".hermes" / "hermes-agent" / "cron" / "scheduler.py"
-CRON_BAK = CRON_SRC.with_suffix(CRON_SRC.suffix + ".hermes_lark.bak")
-SAMPLE_CRON = SAMPLES_DIR / "scheduler.py"
-
-def _ensure_sample() -> Path:
-    src = RUN_BAK if RUN_BAK.exists() else RUN_SRC
-    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-    if src.exists():
-        shutil.copy2(src, SAMPLE_RUN)
-        return SAMPLE_RUN
-    # CI fallback: download from GitHub
-    try:
-        urllib.request.urlretrieve(_RUN_URL, SAMPLE_RUN)
-    except Exception as exc:
-        pytest.skip(f"run.py not found locally and download failed: {exc}")
-    if not SAMPLE_RUN.exists() or SAMPLE_RUN.stat().st_size == 0:
-        pytest.skip("run.py download returned empty file")
-    return SAMPLE_RUN
+SOURCE_ROOT = Path(os.environ.get("HERMES_TEST_SOURCE_ROOT", "/usr/local/lib/hermes-agent"))
 
 
 @pytest.fixture()
 def run_copy(tmp_path: Path) -> Path:
-    src = _ensure_sample()
-    dst = tmp_path / "run.py"
-    shutil.copy2(src, dst)
+    """Copy the real gateway layout, preserving split-module detection."""
+    src_dir = SOURCE_ROOT / "gateway"
+    dst_dir = tmp_path / "gateway"
+    dst_dir.mkdir()
+    for name in ("run.py", "run_inbound.py", "run_turn.py", "run_turn_runner.py"):
+        src = src_dir / name
+        if src.is_file():
+            shutil.copy2(src, dst_dir / name)
+    dst = dst_dir / "run.py"
+    if not dst.is_file():
+        pytest.fail(f"Hermes gateway source not found under {src_dir}")
+    # Production may already carry the plugin hooks after an upgrade.  Tests need
+    # the same Hermes version and layout, but an unpatched baseline, so normalize
+    # only the isolated copy before exercising apply/remove/restore.
+    for path in dst_dir.glob("run*.py"):
+        content = path.read_text(encoding="utf-8")
+        for begin, end in MARKERS:
+            content = _remove_block(content, begin, end)
+        path.write_text(content, encoding="utf-8")
     return dst
-
-
-def _ensure_cron_sample() -> Path:
-    src = CRON_BAK if CRON_BAK.exists() else CRON_SRC
-    SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-    if src.exists():
-        shutil.copy2(src, SAMPLE_CRON)
-        return SAMPLE_CRON
-    try:
-        urllib.request.urlretrieve(_CRON_URL, SAMPLE_CRON)
-    except Exception as exc:
-        pytest.skip(f"scheduler.py not found locally and download failed: {exc}")
-    if not SAMPLE_CRON.exists() or SAMPLE_CRON.stat().st_size == 0:
-        pytest.skip("scheduler.py download returned empty file")
-    return SAMPLE_CRON
 
 
 @pytest.fixture()
 def scheduler_copy(tmp_path: Path) -> Path:
-    src = _ensure_cron_sample()
-    dst = tmp_path / "scheduler.py"
-    shutil.copy2(src, dst)
+    """Copy scheduler plus its split delivery module when present."""
+    src_dir = SOURCE_ROOT / "cron"
+    dst_dir = tmp_path / "cron"
+    dst_dir.mkdir()
+    for name in ("scheduler.py", "scheduler_delivery.py"):
+        src = src_dir / name
+        if src.is_file():
+            shutil.copy2(src, dst_dir / name)
+    dst = dst_dir / "scheduler.py"
+    if not dst.is_file():
+        pytest.fail(f"Hermes scheduler source not found under {src_dir}")
+    delivery = dst_dir / "scheduler_delivery.py"
+    if delivery.is_file():
+        content = delivery.read_text(encoding="utf-8")
+        content = _remove_block(content, MK_CRON_DELIVER, MK_CRON_DELIVER_END)
+        delivery.write_text(content, encoding="utf-8")
     return dst
 
 
@@ -92,6 +84,14 @@ def _patcher(path: Path) -> Patcher:
 
 def _cron_patcher(path: Path) -> CronPatcher:
     return CronPatcher(cron_path=path)
+
+
+def _gateway_snapshot(patcher: Patcher) -> dict[Path, str]:
+    return {path: path.read_text(encoding="utf-8") for path in patcher.target_paths}
+
+
+def _gateway_text(patcher: Patcher) -> str:
+    return "\n".join(_gateway_snapshot(patcher).values())
 
 
 @pytest.fixture()
@@ -330,7 +330,7 @@ class TestApplyRemove:
     def test_apply_injects_all_markers(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
-        content = run_copy.read_text(encoding="utf-8")
+        content = _gateway_text(patcher)
         for begin, end in MARKERS:
             assert begin in content, f"Missing marker: {begin}"
             assert end in content, f"Missing marker: {end}"
@@ -338,8 +338,8 @@ class TestApplyRemove:
     def test_apply_produces_valid_python(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
-        content = run_copy.read_text(encoding="utf-8")
-        ast.parse(content)  # should not raise
+        for path, content in _gateway_snapshot(patcher).items():
+            ast.parse(content, filename=str(path))
 
     def test_find_answer_delta_site_uses_primary_stream_consumer_callback(self) -> None:
         lines = textwrap.dedent("""\
@@ -363,17 +363,18 @@ class TestApplyRemove:
     def test_apply_injects_answer_hook_into_primary_stream_consumer_callback(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
-        lines = run_copy.read_text(encoding="utf-8").splitlines()
+        lines = _gateway_text(patcher).splitlines()
         hook_idx = next(i for i, line in enumerate(lines) if "# HERMES_LARK_ANSWER_BEGIN" in line)
         window = "\n".join(lines[max(0, hook_idx - 8): hook_idx + 16])
 
-        assert "_stream_consumer.on_delta(text)" in window
+        assert "for sink in delta_sinks:" in window
+        assert "sink.on_delta(text)" in window
         assert "if _stream_delta_cb is None and _stts_consumer_ref is not None" not in window
 
     def test_apply_uses_current_turn_message_id_for_card_session(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
-        content = run_copy.read_text(encoding="utf-8")
+        content = _gateway_text(patcher)
 
         assert "# HERMES_LARK_NORMALIZE_BEGIN" in content
         assert "source = event.source\n        # HERMES_LARK_NORMALIZE_BEGIN" in content
@@ -382,12 +383,12 @@ class TestApplyRemove:
         assert "_lark_anchor_id = self._reply_anchor_for_event(event)" in content
         assert "message_id=_lark_inbound_id" in content
         assert "anchor_id=_lark_anchor_id" in content
-        assert "_lark_next_message_id = getattr(pending_event, 'message_id', None) or next_message_id" in content
-        assert "new_message_id=_lark_next_message_id" in content
-        assert "anchor_id=_lark_next_anchor_id" in content
+        assert "_lark_old_message_id = turn_ctx.inbound_message_id or turn_ctx.event_message_id or ''" in content
+        assert "new_message_id=next_inbound_id" in content
+        assert "anchor_id=next_message_id" in content
         assert "# HERMES_LARK_FOLLOWUP_COMPLETE_BEGIN" in content
         assert "message_id=event_message_id" in content
-        assert "on_queued_followup_boundary(message_id=event_message_id, result=result)" in content
+        assert "message_id=turn_ctx.inbound_message_id or turn_ctx.event_message_id or ''" in content
         assert "# HERMES_LARK_FOLLOWUP_RESULT_BEGIN" in content
         assert "on_queued_followup_result(" in content
         assert "on_message_completed_wait(" in content
@@ -411,75 +412,126 @@ class TestApplyRemove:
     def test_apply_idempotent(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
-        after_first = run_copy.read_text(encoding="utf-8")
+        after_first = _gateway_snapshot(patcher)
         patcher.apply()  # second apply should be no-op
-        after_second = run_copy.read_text(encoding="utf-8")
+        after_second = _gateway_snapshot(patcher)
         assert after_first == after_second
 
     def test_apply_upgrades_partial_patch(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
         begin, end = next(pair for pair in MARKERS if "BACKGROUND_REVIEW" in pair[0])
-        content = _remove_block(run_copy.read_text(encoding="utf-8"), begin, end)
-        run_copy.write_text(content, encoding="utf-8")
+        marker_path = next(path for path in patcher.target_paths if begin in path.read_text(encoding="utf-8"))
+        content = _remove_block(marker_path.read_text(encoding="utf-8"), begin, end)
+        marker_path.write_text(content, encoding="utf-8")
 
         patcher.apply()
-        upgraded = run_copy.read_text(encoding="utf-8")
+        upgraded = _gateway_text(patcher)
 
         assert upgraded.count(begin) == 1
         assert upgraded.count(end) == 1
 
     def test_apply_hard_fails_when_injection_site_missing(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
+        sites = patcher._modular_sites()
+        broken_sites = dict(sites)
+        broken_sites["complete"] = (broken_sites["complete"][0], None)
         with (
-            patch("hermes_lark_streaming.patcher._find_handler_return", return_value=None),
+            patch.object(patcher, "_modular_sites", side_effect=[sites, broken_sites]),
             pytest.raises(PatcherError, match="locate complete injection site"),
         ):
             patcher.apply()
 
     def test_remove_restores_markers_free(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
-        original = run_copy.read_text(encoding="utf-8")
+        original = _gateway_snapshot(patcher)
         patcher.apply()
         patcher.remove()
-        after_remove = run_copy.read_text(encoding="utf-8")
+        after_remove = _gateway_snapshot(patcher)
         assert after_remove == original
 
     def test_remove_produces_valid_python(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
         patcher.remove()
-        content = run_copy.read_text(encoding="utf-8")
-        ast.parse(content)
+        for path, content in _gateway_snapshot(patcher).items():
+            ast.parse(content, filename=str(path))
 
     def test_remove_on_unpatched_is_noop(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
-        original = run_copy.read_text(encoding="utf-8")
+        original = _gateway_snapshot(patcher)
         patcher.remove()
-        assert run_copy.read_text(encoding="utf-8") == original
+        assert _gateway_snapshot(patcher) == original
 
     def test_apply_then_remove_repeatedly(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
-        original = run_copy.read_text(encoding="utf-8")
+        original = _gateway_snapshot(patcher)
         for _ in range(3):
             patcher.apply()
             patcher.remove()
-        assert run_copy.read_text(encoding="utf-8") == original
+        assert _gateway_snapshot(patcher) == original
+
+
+class TestLegacySingleFileLayout:
+    def test_verify_apply_remove_restore(self, tmp_path: Path) -> None:
+        # Frozen structural fixture: no network or dependency on a retired checkout.
+        source = textwrap.dedent('''\
+            async def _handle_message(self, event):
+                source = event.source
+            async def _handle_message_with_agent(self, source, event):
+                async def progress_callback(event_type):
+                    pass
+                def _stream_delta_cb(text):
+                    _stream_consumer.on_delta(text)
+                def _interim_assistant_cb(text):
+                    pass
+                agent.reasoning_config = reasoning_config
+                agent.background_review_callback = _bg_review_send
+                self.hooks.emit("agent:end", {})
+                # Discarding stale agent result
+                if stale:
+                    return None
+                # Restart typing indicator so the user sees activity
+                was_interrupted = result.get("interrupted")
+                images, text_content = adapter.extract_images(response)
+                _already_sent = bool(agent_result.get("already_sent"))
+                return _preserve_queued_followup_history_offset(result, followup_result)
+        ''')
+        target = tmp_path / "run.py"
+        target.write_text(source, encoding="utf-8")
+        patcher = _patcher(target)
+        assert not patcher._is_modular
+        patcher.verify_target()
+        patcher.apply()
+        patched = target.read_text(encoding="utf-8")
+        ast.parse(patched)
+        for begin, end in MARKERS:
+            assert patched.count(begin) == patched.count(end) == 1
+        assert "_stream_consumer.on_delta(text)" in patched
+        assert "new_message_id=_lark_next_message_id" in patched
+        assert "on_queued_followup_boundary(message_id=event_message_id, result=result)" in patched
+        patcher.apply()
+        assert target.read_text(encoding="utf-8") == patched
+        patcher.remove()
+        assert target.read_text(encoding="utf-8") == source
+        patcher.apply()
+        patcher.restore()
+        assert target.read_text(encoding="utf-8") == source
 
 
 class TestBackupRestore:
     def test_backup_created_on_apply(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
         patcher.apply()
-        backup = run_copy.with_suffix(run_copy.suffix + ".hermes_lark.bak")
-        assert backup.exists()
+        for path in patcher.target_paths:
+            assert path.with_suffix(path.suffix + ".hermes_lark.bak").exists()
 
     def test_restore_recovers_original(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
-        original = run_copy.read_text(encoding="utf-8")
+        original = _gateway_snapshot(patcher)
         patcher.apply()
         patcher.restore()
-        assert run_copy.read_text(encoding="utf-8") == original
+        assert _gateway_snapshot(patcher) == original
 
     def test_restore_fails_without_backup(self, run_copy: Path) -> None:
         patcher = _patcher(run_copy)
@@ -517,6 +569,50 @@ class TestModularGatewayPatcher:
         patcher.remove()
         assert originals == {path: path.read_text(encoding="utf-8") for path in (inbound, turn, runner)}
 
+    @pytest.mark.asyncio
+    async def test_non_feishu_start_hook_does_not_create_card_session(self) -> None:
+        namespace: dict = {}
+        exec(
+            "async def run(self, source, event):\n"
+            + _start_hook("    ")
+            + "    return event.message_id\n",
+            namespace,
+        )
+        source = SimpleNamespace(platform=SimpleNamespace(value="telegram"), chat_id="tg-chat")
+        event = SimpleNamespace(platform="telegram", message_id="tg-message")
+        owner = SimpleNamespace(_reply_anchor_for_event=lambda _event: "tg-anchor")
+
+        with patch("hermes_lark_streaming.patch.on_message_started") as started:
+            result = await namespace["run"](owner, source, event)
+
+        assert result == "tg-message"
+        started.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_feishu_complete_hook_preserves_already_sent(self) -> None:
+        namespace: dict = {}
+        exec(
+            "async def run(source, event, agent_result):\n"
+            "    response = 'telegram response'\n"
+            "    _turn_seconds = 1.0\n"
+            + _modular_complete_hook("    ")
+            + "    return agent_result\n",
+            namespace,
+        )
+        source = SimpleNamespace(platform=SimpleNamespace(value="telegram"))
+        event = SimpleNamespace(platform="telegram", message_id="tg-message")
+        result = {"already_sent": True}
+
+        with (
+            patch("hermes_lark_streaming.patch.on_message_completed_wait", new=AsyncMock()) as completed,
+            patch("hermes_lark_streaming.patch.on_message_needs_text_fallback") as fallback,
+        ):
+            returned = await namespace["run"](source, event, result)
+
+        assert returned == {"already_sent": True}
+        completed.assert_not_awaited()
+        fallback.assert_not_called()
+
 
 # --- CronPatcher ---
 
@@ -542,40 +638,40 @@ class TestCronApplyRemove:
     def test_apply_injects_markers(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
         cp.apply()
-        content = scheduler_copy.read_text(encoding="utf-8")
+        content = cp.target_path.read_text(encoding="utf-8")
         assert MK_CRON_DELIVER in content
         assert MK_CRON_DELIVER_END in content
 
     def test_apply_produces_valid_python(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
         cp.apply()
-        content = scheduler_copy.read_text(encoding="utf-8")
-        compile(content, str(scheduler_copy), "exec")
+        content = cp.target_path.read_text(encoding="utf-8")
+        compile(content, str(cp.target_path), "exec")
 
     def test_apply_idempotent(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
         cp.apply()
-        first = scheduler_copy.read_text(encoding="utf-8")
+        first = cp.target_path.read_text(encoding="utf-8")
         cp.apply()
-        assert scheduler_copy.read_text(encoding="utf-8") == first
+        assert cp.target_path.read_text(encoding="utf-8") == first
 
     def test_remove_restores_original(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
-        original = scheduler_copy.read_text(encoding="utf-8")
+        original = cp.target_path.read_text(encoding="utf-8")
         cp.apply()
         cp.remove()
-        assert scheduler_copy.read_text(encoding="utf-8") == original
+        assert cp.target_path.read_text(encoding="utf-8") == original
 
     def test_remove_on_unpatched_is_noop(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
-        original = scheduler_copy.read_text(encoding="utf-8")
+        original = cp.target_path.read_text(encoding="utf-8")
         cp.remove()
-        assert scheduler_copy.read_text(encoding="utf-8") == original
+        assert cp.target_path.read_text(encoding="utf-8") == original
 
     def test_injected_hook_references_on_cron_deliver(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
         cp.apply()
-        content = scheduler_copy.read_text(encoding="utf-8")
+        content = cp.target_path.read_text(encoding="utf-8")
         assert "on_cron_deliver" in content
         assert "platform_name.lower()" in content
         assert "delivered = True" in content
@@ -647,15 +743,15 @@ class TestCronBackupRestore:
     def test_backup_created_on_apply(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
         cp.apply()
-        backup = scheduler_copy.with_suffix(scheduler_copy.suffix + ".hermes_lark.bak")
+        backup = cp.target_path.with_suffix(cp.target_path.suffix + ".hermes_lark.bak")
         assert backup.exists()
 
     def test_restore_recovers_original(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
-        original = scheduler_copy.read_text(encoding="utf-8")
+        original = cp.target_path.read_text(encoding="utf-8")
         cp.apply()
         cp.restore()
-        assert scheduler_copy.read_text(encoding="utf-8") == original
+        assert cp.target_path.read_text(encoding="utf-8") == original
 
     def test_restore_fails_without_backup(self, scheduler_copy: Path) -> None:
         cp = _cron_patcher(scheduler_copy)
