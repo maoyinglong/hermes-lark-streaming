@@ -239,9 +239,23 @@ def _split_long_text(text: str, limit: int = _MAX_CHUNK_CHARS) -> list[str]:
                     capacity = limit
                 cut = min(end, pos + capacity)
                 if cut < end:
-                    boundary = max(source.rfind("\n", pos, cut), source.rfind(" ", pos, cut))
-                    if boundary >= pos + capacity // 2:
-                        cut = boundary + 1
+                    # 优选分界线：
+                    # 1. 优先段落分界 \n\n，保持整个列表项/Markdown块完整
+                    # 2. 独立行首 \n(?=[^\s])，不在列表项内部缩进行（如链接行）切断
+                    # 3. 普通换行 \n 或空格
+                    p_para = source.rfind("\n\n", pos, cut)
+                    if p_para >= pos + capacity // 3:
+                        cut = p_para + 2
+                    else:
+                        p_line = -1
+                        for m in re.finditer(r"\n(?=[^\s])", source[pos:cut]):
+                            p_line = pos + m.start()
+                        if p_line >= pos + capacity // 2:
+                            cut = p_line + 1
+                        else:
+                            boundary = max(source.rfind("\n", pos, cut), source.rfind(" ", pos, cut))
+                            if boundary >= pos + capacity // 2:
+                                cut = boundary + 1
                 add(source[pos:cut])
                 pos = cut
             if not match:
