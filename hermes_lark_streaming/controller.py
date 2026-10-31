@@ -342,7 +342,35 @@ class StreamCardController(StreamingController):
             context=context,
         )
 
-        return await self._complete_session_wait(session)
+        res = await self._complete_session_wait(session)
+        if res and session.card_msg_id and answer:
+            self._cache_card_text(session.card_msg_id, answer)
+        return res
+
+    @staticmethod
+    def _cache_card_text(card_msg_id: str, text: str) -> None:
+        if not card_msg_id or not text:
+            return
+        try:
+            from pathlib import Path
+            import json
+            cache_file = Path("/root/.hermes/cache/feishu_card_text_cache.json")
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if cache_file.exists():
+                try:
+                    data = json.loads(cache_file.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data[card_msg_id] = text[:3000]
+            if len(data) > 100:
+                keys = list(data.keys())
+                data = {k: data[k] for k in keys[-100:]}
+            tmp = cache_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(cache_file)
+        except Exception:
+            pass
 
     def on_cron_deliver(
         self,
